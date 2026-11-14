@@ -11,18 +11,18 @@ class VoiceDspProcessor(private val sampleRate: Int) {
     @Volatile var enabled: Boolean = false
     @Volatile var pitchRatio: Float = 1.45f
     @Volatile var robotMix: Float = 0.0f
-    @Volatile var echoMix: Float = 0.08f
-    @Volatile var noiseGateThreshold: Float = 0.012f
+    @Volatile var echoMix: Float = 0.0f
+    @Volatile var noiseGateThreshold: Float = 0.022f
 
-    private val bufSize = 4096
+    private val bufSize = 2048
     private val bufMask = bufSize - 1
     private val pitchBuffer = FloatArray(bufSize)
     private var writeIdx = 0
 
-    private val windowSize = 2048f
+    private val windowSize = 1024f
     private var phase = 0f
 
-    private val echoDelaySamples = (sampleRate * 0.18f).toInt().coerceAtLeast(1)
+    private val echoDelaySamples = (sampleRate * 0.16f).toInt().coerceAtLeast(1)
     private val echoBuffer = FloatArray(echoDelaySamples)
     private var echoIdx = 0
 
@@ -30,18 +30,20 @@ class VoiceDspProcessor(private val sampleRate: Int) {
     private val modFreqHz = 55.0
 
     private var env = 0f
+    private var prevRaw = 0f
+    private var hpOut = 0f
 
     fun applyPreset(preset: AnimeVoicePreset) {
         pitchRatio = preset.pitchRatio
         robotMix = preset.robotMix
-        echoMix = preset.echoMix
+        echoMix = if (preset == AnimeVoicePreset.DEMON_LORD) 0.25f else 0.0f
     }
 
     fun processBlock(input: ShortArray, output: ShortArray, count: Int) {
         val isOn = enabled
         val pRatio = pitchRatio.coerceIn(0.5f, 2.2f)
         val rMix = robotMix.coerceIn(0f, 1f)
-        val eMix = echoMix.coerceIn(0f, 0.8f)
+        val eMix = echoMix.coerceIn(0f, 0.5f)
         val gate = noiseGateThreshold
 
         val phaseDelta = (1.0f - pRatio) / windowSize
@@ -55,13 +57,17 @@ class VoiceDspProcessor(private val sampleRate: Int) {
                 continue
             }
 
-            val absIn = abs(raw)
-            env = 0.992f * env + 0.008f * absIn
-            val gated = if (env < gate) raw * (env / gate).coerceIn(0f, 1f) else raw
+            hpOut = 0.992f * (hpOut + raw - prevRaw)
+            prevRaw = raw
+            val clean = hpOut
+
+            val absIn = abs(clean)
+            env = 0.985f * env + 0.015f * absIn
+            val gated = if (env < gate) clean * (env / gate).coerceIn(0f, 1f) * 0.25f else clean
 
             pitchBuffer[writeIdx] = gated
 
-            var sample = if (abs(pRatio - 1.0f) < 0.01f) {
+            var sample = if (abs(pRatio - 1.0f) < 0.02f) {
                 gated
             } else {
                 val p1 = phase
@@ -92,12 +98,14 @@ class VoiceDspProcessor(private val sampleRate: Int) {
                 sample = sample * (1.0f - rMix) + (sample * mod) * rMix
             }
 
-            val delayed = echoBuffer[echoIdx]
-            echoBuffer[echoIdx] = sample + delayed * 0.35f
-            echoIdx = (echoIdx + 1) % echoDelaySamples
-            sample += delayed * eMix
+            if (eMix > 0.01f) {
+                val delayed = echoBuffer[echoIdx]
+                echoBuffer[echoIdx] = sample + delayed * 0.30f
+                echoIdx = (echoIdx + 1) % echoDelaySamples
+                sample += delayed * eMix
+            }
 
-            val limited = tanh((sample * 1.15f).toDouble()).toFloat()
+            val limited = tanh((sample * 1.1f).toDouble()).toFloat()
             val outInt = (limited * 32767.0f).toInt().coerceIn(-32768, 32767)
             output[i] = outInt.toShort()
         }
