@@ -17,8 +17,12 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -43,14 +47,17 @@ class VoiceOverlayService : Service() {
     }
 
     private lateinit var windowManager: WindowManager
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var bubbleView: View? = null
     private var menuView: View? = null
+    private var statusView: TextView? = null
     private var isMenuOpen = false
 
     private val isRunning = AtomicBoolean(false)
     private var audioThread: Thread? = null
     private var dsp: VoiceDspProcessor? = null
     private var activePreset = AnimeVoicePreset.ANIME_GIRL
+    @Volatile private var micStatusText = "Mic: Starting..."
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -101,7 +108,15 @@ class VoiceOverlayService : Service() {
         menuView?.let { if (it.isAttachedToWindow) windowManager.removeView(it) }
         bubbleView = null
         menuView = null
+        statusView = null
         super.onDestroy()
+    }
+
+    private fun updateStatus(text: String) {
+        micStatusText = text
+        mainHandler.post {
+            statusView?.text = text
+        }
     }
 
     private fun startAudioEngine() {
@@ -126,16 +141,18 @@ class VoiceOverlayService : Service() {
                 AudioFormat.ENCODING_PCM_16BIT
             )
 
-            val chunkFrames = 512
+            val chunkFrames = 256
             val recBufBytes = maxOf(minRecBuf, chunkFrames * 4)
             val playBufBytes = maxOf(minPlayBuf, chunkFrames * 4)
 
             var recorder: AudioRecord? = null
             var track: AudioTrack? = null
+            var aec: AcousticEchoCanceler? = null
+            var ns: NoiseSuppressor? = null
 
             try {
                 recorder = AudioRecord.Builder()
-                    .setAudioSource(MediaRecorder.AudioSource.MIC)
+                    .setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
                     .setAudioFormat(
                         AudioFormat.Builder()
                             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
@@ -149,7 +166,7 @@ class VoiceOverlayService : Service() {
                 track = AudioTrack.Builder()
                     .setAudioAttributes(
                         AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                             .build()
                     )
@@ -168,7 +185,19 @@ class VoiceOverlayService : Service() {
                 if (recorder.state != AudioRecord.STATE_INITIALIZED ||
                     track.state != AudioTrack.STATE_INITIALIZED
                 ) {
+                    updateStatus("Mic error: Audio hardware busy")
                     return@Thread
+                }
+
+                if (AcousticEchoCanceler.isAvailable()) {
+                    aec = runCatching {
+                        AcousticEchoCanceler.create(recorder.audioSessionId)?.apply { enabled = true }
+                    }.getOrNull()
+                }
+                if (NoiseSuppressor.isAvailable()) {
+                    ns = runCatching {
+                        NoiseSuppressor.create(recorder.audioSessionId)?.apply { enabled = true }
+                    }.getOrNull()
                 }
 
                 val inSamples = ShortArray(chunkFrames)
@@ -176,6 +205,7 @@ class VoiceOverlayService : Service() {
 
                 recorder.startRecording()
                 track.play()
+                updateStatus("Mic ready (Hold near ear)")
 
                 while (isRunning.get() && !Thread.currentThread().isInterrupted) {
                     val readCount = recorder.read(inSamples, 0, chunkFrames)
@@ -184,11 +214,18 @@ class VoiceOverlayService : Service() {
                             processor.processBlock(inSamples, outSamples, readCount)
                             track.write(outSamples, 0, readCount)
                         }
+                    } else if (readCount < 0) {
+                        updateStatus("Mic error ($readCount)")
+                        break
                     }
                 }
             } catch (_: SecurityException) {
+                updateStatus("Mic permission denied")
             } catch (_: Exception) {
+                updateStatus("Mic blocked by another app")
             } finally {
+                runCatching { aec?.release() }
+                runCatching { ns?.release() }
                 runCatching { recorder?.stop() }
                 runCatching { recorder?.release() }
                 runCatching { track?.stop() }
@@ -277,6 +314,7 @@ class VoiceOverlayService : Service() {
         if (isMenuOpen) {
             menuView?.let { if (it.isAttachedToWindow) windowManager.removeView(it) }
             menuView = null
+            statusView = null
             isMenuOpen = false
         } else {
             showMenu()
@@ -286,7 +324,7 @@ class VoiceOverlayService : Service() {
 
     private fun showMenu() {
         val params = WindowManager.LayoutParams(
-            dp(270),
+            dp(275),
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
@@ -325,11 +363,20 @@ class VoiceOverlayService : Service() {
         header.addView(masterSwitch)
         container.addView(header)
 
+        val status = TextView(this).apply {
+            text = micStatusText
+            setTextColor(Color.parseColor("#80CBC4"))
+            textSize = 11f
+            setPadding(0, dp(2), 0, dp(6))
+        }
+        statusView = status
+        container.addView(status)
+
         val pitchLabel = TextView(this).apply {
             text = "Pitch: ${"%.2f".format(dsp?.pitchRatio ?: activePreset.pitchRatio)}x"
             setTextColor(Color.parseColor("#CCCCCC"))
             textSize = 12f
-            setPadding(0, dp(8), 0, dp(2))
+            setPadding(0, dp(4), 0, dp(2))
         }
         val pitchSeek = SeekBar(this).apply {
             max = 150
